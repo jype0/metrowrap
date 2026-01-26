@@ -1,0 +1,221 @@
+// SPDX-FileCopyrightText: © 2026 TTKB, LLC
+// SPDX-License-Identifier: BSD-3-CLAUSE
+use std::fs;
+use std::io::Read;
+use std::path::{Component, Path, PathBuf};
+
+use encoding_rs::{ISO_8859_8_I, UTF_8};
+use encoding_rs_io::DecodeReaderBytesBuilder;
+
+pub struct MakeRule {
+    pub target: String,
+    pub source: Option<String>,
+    pub includes: Vec<String>,
+}
+
+impl MakeRule {
+    pub fn new(data: &[u8], use_wibo: bool) -> Result<Self, Box<dyn std::error::Error>> {
+        let encoding = Some(if use_wibo { ISO_8859_8_I } else { UTF_8 });
+        // Note: Real implementation would use encoding_rs crate for non-utf8
+        let mut reader = DecodeReaderBytesBuilder::new()
+            .encoding(encoding)
+            .build(data);
+        let mut rule_str = String::new();
+        reader.read_to_string(&mut rule_str)?;
+        let rule_str = rule_str.replace("\\\n", " ").replace("\\\r\n", " ");
+
+        let parts: Vec<&str> = rule_str.splitn(2, ": ").collect();
+
+        if parts.len() < 2 {
+            return Err("No valid dependency list".into());
+        }
+
+        let target = path_from_wibo(parts[0]).to_string_lossy().to_string();
+        let remaining = parts[1];
+
+        let mut files: Vec<String> = remaining
+            .split_whitespace()
+            .map(|s| s.to_string())
+            .collect();
+
+        if use_wibo {
+            files = files
+                .into_iter()
+                .map(|p| path_from_wibo(&p).to_string_lossy().to_string())
+                .collect();
+        }
+
+        let source = if !files.is_empty() {
+            Some(files.remove(0))
+        } else {
+            None
+        };
+
+        Ok(MakeRule {
+            target,
+            source,
+            includes: files,
+        })
+    }
+
+    pub fn as_str(&self) -> String {
+        let mut rule = format!("{}: ", self.target);
+        if let Some(src) = &self.source {
+            rule.push_str(src);
+            rule.push(' ');
+        }
+        for include in &self.includes {
+            rule.push_str(&format!("\\\n\t{} ", include));
+        }
+        rule.push('\n');
+        rule
+    }
+}
+
+pub fn path_from_wibo(path_str: &str) -> PathBuf {
+    let mut path_str = path_str.replace('\\', "/");
+    if path_str.starts_with("//?/") {
+        path_str = path_str[4..].to_string();
+    }
+    if path_str.to_lowercase().starts_with("z:/") {
+        path_str = path_str[2..].to_string();
+    }
+
+    let path = PathBuf::from(&path_str);
+    if path.is_file() {
+        return path;
+    }
+
+    let mut resolved_path = PathBuf::new();
+
+    for component in path.components() {
+        match component {
+            Component::RootDir => {
+                resolved_path.push("/");
+            }
+            Component::Normal(os_name) => {
+                let name_to_find = os_name.to_string_lossy().to_lowercase();
+                let mut found_exact = false;
+
+                // First, check if the exact component exists in the current path
+                let exact_candidate = resolved_path.join(os_name);
+                if exact_candidate.exists() {
+                    resolved_path.push(os_name);
+                    found_exact = true;
+                } else {
+                    // Search the directory for a case-insensitive match
+                    let search_dir = if resolved_path.as_os_str().is_empty() {
+                        Path::new(".")
+                    } else {
+                        resolved_path.as_path()
+                    };
+
+                    if let Ok(entries) = fs::read_dir(search_dir) {
+                        for entry in entries.flatten() {
+                            if let Some(entry_name_str) = entry.file_name().to_str() {
+                                if entry_name_str.to_lowercase() == name_to_find {
+                                    resolved_path.push(entry.file_name());
+                                    found_exact = true;
+                                    break;
+                                }
+                            }
+                        }
+                    }
+                }
+
+                // If no match found, push the original name and hope for the best
+                // (it might be a file that hasn't been created yet)
+                if !found_exact {
+                    resolved_path.push(os_name);
+                }
+            }
+            Component::CurDir => {}
+            Component::ParentDir => {
+                resolved_path.pop();
+            }
+            Component::Prefix(_) => {
+                // Should be handled by the drive letter logic above
+            }
+        }
+    }
+
+    resolved_path
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::path::PathBuf;
+
+    #[test]
+    fn test_make_rule_parsing() {
+        let data = b"target.o: source.c include.h";
+        let rule = MakeRule::new(data, false).unwrap();
+
+        assert_eq!(rule.target, "target.o");
+        assert_eq!(rule.source, Some("source.c".to_string()));
+        assert_eq!(rule.includes[0], "include.h");
+    }
+
+    #[test]
+    fn test_make_rule_empty() {
+        let empty_data = b"";
+        // Assuming MakeRule::new returns an Option or Result
+        let rule = MakeRule::new(empty_data, false);
+        assert!(rule.is_err());
+    }
+
+    #[test]
+    fn test_make_rule_simple() {
+        // Simulating a wibo-encoded dependency string
+        let wibo_make_rule = b"Z:\\tmp\\test_dir\\result.o: test.c \r\n";
+
+        let rule = MakeRule::new(wibo_make_rule, true).expect("Failed to parse wibo rule");
+
+        // The path_from_wibo logic should convert Z:\ to /
+        assert_eq!(rule.target, "/tmp/test_dir/result.o");
+        assert_eq!(rule.source, Some("test.c".to_string()));
+        assert!(rule.includes.is_empty());
+
+        let output = rule.as_str();
+        assert!(output.contains("/tmp/test_dir/result.o: test.c")); //
+    }
+
+    #[test]
+    fn test_make_rule_with_includes() {
+        let wibo_make_rule = b"Z:\\tmp\\result.o: test2.c \\\r\n\tZ:\\home\\user\\decl.h \\\r\n\t\\\\?\\Z:\\home\\user\\lib.h \r\n";
+
+        let rule = MakeRule::new(wibo_make_rule, true).expect("Failed to parse complex rule");
+
+        assert_eq!(rule.source, Some("test2.c".to_string()));
+        assert_eq!(rule.includes.len(), 2);
+        assert_eq!(rule.includes[0], "/home/user/decl.h");
+        assert_eq!(rule.includes[1], "/home/user/lib.h"); //
+    }
+
+    #[test]
+    fn test_unix_deps() {
+        let unix_data = b"test.o: test.c test.h";
+        let rule = MakeRule::new(unix_data, false).expect("Failed to parse unix rule");
+
+        assert_eq!(rule.target, "test.o");
+        assert_eq!(rule.includes[0], "test.h"); //
+    }
+
+    #[test]
+    fn test_path_from_wibo_translation() {
+        // Test the helper function directly
+        assert_eq!(
+            path_from_wibo("Z:\\home\\user\\file.c"),
+            PathBuf::from("/home/user/file.c")
+        );
+        assert_eq!(
+            path_from_wibo("\\\\?\\Z:\\home\\user\\file.c"),
+            PathBuf::from("/home/user/file.c")
+        );
+        assert_eq!(
+            path_from_wibo("relative\\path.h"),
+            PathBuf::from("relative/path.h")
+        ); //
+    }
+}

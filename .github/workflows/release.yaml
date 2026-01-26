@@ -1,0 +1,175 @@
+name: Publish to crates.io
+
+on:
+  workflow_dispatch:
+    inputs:
+      dry_run:
+        description: 'Perform a dry run (no actual publish)'
+        required: false
+        type: boolean
+        default: true
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+  RUST_BACKTRACE: 1
+
+#on:
+#  push:
+#    tags:
+#      - "v[0-9]+.[0-9]+.[0-9]+*"
+
+jobs:
+  # -------------------------------------------------------------------------
+  # Gate the publish on a clean full test run so a bad tag can't publish
+  # broken code.  Mirrors the CI jobs rather than calling them via
+  # workflow_call to keep the release self-contained.
+  # -------------------------------------------------------------------------
+  unit-test:
+    name: Unit tests (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: true
+      matrix:
+        os:
+          - ubuntu-latest
+          #- macos-latest
+          #- windows-latest
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: "1.87.0"
+
+      - name: Install clang + lld (Linux only)
+        if: runner.os == 'Linux'
+        run: sudo apt-get install -y clang lld binutils-mipsel-linux-gnu
+
+      - name: Cache cargo registry and build artifacts
+        uses: Swatinem/rust-cache@v2
+
+      - name: Run unit tests
+        run: make test-unit
+
+  integration-test:
+    name: Integration tests
+    runs-on: ubuntu-latest
+    needs: unit-test
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: "1.87.0"
+
+      - name: Install system dependencies
+        run: sudo make debian-dependencies
+
+      - name: Cache cargo registry and build artifacts
+        uses: Swatinem/rust-cache@v2
+
+      - name: Cache private toolchain binaries
+        id: cache-toolchain
+        uses: actions/cache@v4
+        with:
+          path: target/.private/bin
+          key: toolchain-${{ runner.os }}-wibo-0.6.13-mwcc-219
+
+      - name: Download toolchain (if not cached)
+        if: steps.cache-toolchain.outputs.cache-hit != 'true'
+        run: make dependencies
+
+      - name: Run integration tests
+        run: make test-integration
+
+      - name: Check package
+        run: make dist
+
+      - name: Verify package contents
+        run: |
+          cargo package --list
+          echo "Package size:"
+          du -h target/package/psy-k-*.crate
+
+
+  publish:
+    name: Publish to crates.io
+    runs-on: ubuntu-latest
+    needs: integration-test
+    if: github.ref == 'refs/heads/master' || github.ref == 'refs/heads/main'
+
+    permissions:
+      contents: write
+
+    outputs:
+      version: ${{ steps.get_version.outputs.version }}
+
+    steps:
+    - name: Checkout code
+      uses: actions/checkout@v4
+
+    - name: Install Rust toolchain
+      uses: dtolnay/rust-toolchain@stable
+
+    - name: Get crate version
+      id: get_version
+      run: |
+        CRATE_VERSION=$(cargo metadata --no-deps --format-version 1 | jq -r '.packages[0].version')
+        echo "version=$CRATE_VERSION" >> "$GITHUB_OUTPUT"
+
+    - name: Verify version not already published
+      run: |
+        CRATE_NAME=$(cargo metadata --no-deps --format-version 1 | jq -r '.packages[0].name')
+        CRATE_VERSION=${{ steps.get_version.outputs.version }}
+        echo "Crate: $CRATE_NAME v$CRATE_VERSION"
+
+        # Check if version already exists on crates.io
+        if cargo search "$CRATE_NAME" | grep -q "^$CRATE_NAME = \"$CRATE_VERSION\""; then
+          echo "ERROR: Version $CRATE_VERSION already published!"
+          exit 1
+        fi
+
+        echo "Version $CRATE_VERSION not yet published - OK to proceed"
+
+    - name: Dry run publish
+      if: inputs.dry_run == true
+      run: |
+        echo "=== DRY RUN MODE ==="
+        cargo publish --workspace --dry-run
+        echo "Dry run completed successfully!"
+        echo "To publish for real, run this workflow again with 'Perform a dry run' unchecked"
+
+    - name: Publish to crates.io
+      if: inputs.dry_run == false
+      run: cargo publish --workspace --token ${{ secrets.CARGO_REGISTRY_TOKEN }}
+      env:
+        CARGO_REGISTRY_TOKEN: ${{ secrets.CARGO_REGISTRY_TOKEN }}
+
+    - name: Create git tag
+      if: inputs.dry_run == false
+      run: |
+        CRATE_VERSION=${{ steps.get_version.outputs.version }}
+        git config user.name "GitHub Actions"
+        git config user.email "actions@github.com"
+        git tag -a "v$CRATE_VERSION" -m "Release v$CRATE_VERSION"
+        git push origin "v$CRATE_VERSION"
+
+    - name: Create GitHub Release
+      if: inputs.dry_run == false
+      uses: actions/create-release@v1
+      env:
+        GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+      with:
+        tag_name: v${{ steps.get_version.outputs.version }}
+        release_name: Release v${{ steps.get_version.outputs.version }}
+        draft: false
+        prerelease: false
+        body: |
+          See [CHANGELOG.md](https://github.com/${{ github.repository }}/blob/master/CHANGELOG.md) for details.

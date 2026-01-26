@@ -1,0 +1,38 @@
+[package]
+name = "metrowrap"
+version = "0.1.0"
+edition = "2024"
+authors = ["Jonathan Hohle <jon@ttkb.co>"]
+license = "BSD-3-Clause"
+repository = "https://github.com/ttkb-oss/metrowrap"
+description = "A mwcc wrapper"
+keywords = ["mwcc", "metrowerks", "codewarrior", "decompiling", "asm"]
+categories = ["data-structures", "development-tools", "game-development", "compilers", "command-line-utilities"]
+rust-version = "1.87.0"
+exclude = [
+    ".gitignore",
+    "/.github",
+    "target/.private",
+]
+readme = "README.md"
+
+[[bin]]
+name = "mw"
+path = "src/main.rs"
+
+[dependencies]
+byteorder = "1.5"
+clap = { version = "4.4", features = ["derive"] }
+encoding_rs = "0.8"
+encoding_rs_io = "0.1"
+object = { version = "0.32", features = ["write", "elf"] }
+rayon = "1.11"
+regex = "1.10"
+tempfile = "3"
+thiserror = "1.0"
+unescape = "0.1"
+
+[profile.release]
+lto = "thin"
+codegen-units = 1
+# strip = true

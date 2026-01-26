@@ -1,0 +1,54 @@
+name: Coverage
+
+on:
+  push:
+    branches: ["main"]
+  # Allow manual trigger from the Actions tab
+  workflow_dispatch:
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  coverage:
+    name: Coverage
+    runs-on: ubuntu-latest
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: "1.87.0"
+          components: llvm-tools-preview
+
+      - name: Install system dependencies
+        run: sudo apt-get install -y clang lld binutils-mipsel-linux-gnu
+
+      - name: Cache cargo registry and build artifacts
+        uses: Swatinem/rust-cache@v2
+
+      - name: Install cargo-llvm-cov
+        uses: taiki-e/install-action@cargo-llvm-cov
+
+      - name: Cache private toolchain binaries
+        id: cache-toolchain
+        uses: actions/cache@v4
+        with:
+          path: target/.private/bin
+          key: toolchain-${{ runner.os }}-wibo-0.6.13-mwcc-219
+
+      - name: Download toolchain (if not cached)
+        if: steps.cache-toolchain.outputs.cache-hit != 'true'
+        run: make dependencies
+
+      - name: Generate coverage report
+        run: make coverage
+
+      - name: Upload to Codecov
+        uses: codecov/codecov-action@v4
+        with:
+          files: target/.private/coverage/lcov.info
+          fail_ci_if_error: true
+          token: ${{ secrets.CODECOV_TOKEN }}
