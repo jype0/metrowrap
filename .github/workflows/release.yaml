@@ -70,7 +70,7 @@ jobs:
           toolchain: "1.87.0"
 
       - name: Install system dependencies
-        run: sudo make debian-dependencies
+        run: sudo apt-get install -y clang lld binutils-mipsel-linux-gnu
 
       - name: Cache cargo registry and build artifacts
         uses: Swatinem/rust-cache@v2

@@ -312,7 +312,7 @@ impl Elf {
         self.symtab.add_symbol(sym)
     }
 
-    fn function_names(&self) -> Vec<String> {
+    pub fn function_names(&self) -> Vec<String> {
         let mut function_symbols = self
             .get_symbols()
             .iter()

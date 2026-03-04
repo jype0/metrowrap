@@ -199,34 +199,17 @@ mw-rodata: # $(WIBO) $(MWCCPSP)
 .PHONY: sotn-mwccgap
 sotn-mwccgap:
 	cd ../sotn-decomp; \
-    VERSION=pspeu tools/sotn_str/target/release/sotn_str process -p -f src/st/nz0_psp/e_cutscene_dialogue.c | \
-    .venv/bin/python3 tools/mwccgap/mwccgap.py \
-         ../metrowrap/e_cutscene_dialogue.c.mwccgap.o \
-         --src-dir src/st/nz0_psp \
-         --mwcc-path bin/mwccpsp.exe \
-         --use-wibo --wibo-path bin/wibo \
-         --as-path tools/pspas/target/release/pspas \
-         --asm-dir-prefix asm/pspeu \
-         --target-encoding sjis \
-         --macro-inc-path include/macro.inc \
-         -gccinc \
-         -Iinclude \
-         -Iinclude/pspsdk \
-         -D_internal_version_pspeu \
-         -DSOTN_STR  \
-         -c -lang c \
-         -sdatathreshold 0 \
-         -char unsigned \
-         -fl divbyzerocheck \
-         -Op \
-         -opt nointrinsics
+        VERSION=pspeu tools/sotn_str/target/release/sotn_str process -p -f src/main_psp/31178.c | \
+        time .venv/bin/python3 tools/mwccgap/mwccgap.py \
+         ../metrowrap/31178.c.mwccgap.o \
+         --src-dir src/main_psp --mwcc-path bin/mwccpsp.exe --use-wibo --wibo-path bin/wibo --as-path tools/pspas/target/release/pspas --asm-dir-prefix asm/pspeu --target-encoding utf8 --macro-inc-path include/macro.inc -gccinc -Iinclude -Iinclude/pspsdk -D_internal_version_pspeu -DSOTN_STR  -c -lang c -sdatathreshold 0 -char unsigned -fl divbyzerocheck -Op -opt nointrinsics
 
 .PHONY: sotn-mw
 sotn-mw:
 	cargo build --release
 	cd ../sotn-decomp; \
     VERSION=pspeu tools/sotn_str/target/release/sotn_str process -p -f src/main_psp/31178.c | \
-    ~/.cargo/bin/flamegraph -o ../metrowrap/31178.c.svg -- ../metrowrap/target/release/mw \
+    ~/.cargo/bin/flamegraph -o ../metrowrap/31178.c.svg -- time ../metrowrap/target/release/mw \
         -o ../metrowrap/31178.c.mw.o \
         --src-dir src/main_psp \
         --mwcc-path bin/mwccpsp.exe \

@@ -129,6 +129,13 @@ pub fn process_c_file(
 
     let rel_text_sh_name = compiled_elf.add_sh_symbol(".rel.text".to_string());
 
+    let stub_functions: HashSet<String> = compiled_elf
+        .function_names()
+        .iter()
+        .filter_map(|name| name.strip_prefix(FUNCTION_PREFIX))
+        .map(str::to_string)
+        .collect();
+
     compiled_elf.symbol_cleanup();
 
     let symbol_to_section_idx: HashMap<String, u16> = compiled_elf
@@ -139,7 +146,12 @@ pub fn process_c_file(
         .collect();
 
     let asm_objects: Vec<(&PathBuf, usize, Vec<u8>)> = asm_files
-        .par_iter()
+        .iter()
+        .filter(|(asm_file, _)| {
+            let stub = asm_file.file_stem().unwrap().display().to_string();
+            stub_functions.contains(&stub)
+        })
+        .par_bridge()
         .map(|(asm_file, num_rodata_symbols)| {
             let assembled_bytes = assembler.assemble_file(asm_file).expect("assembled bytes");
             (asm_file, *num_rodata_symbols, assembled_bytes)
