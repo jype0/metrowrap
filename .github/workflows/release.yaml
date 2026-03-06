@@ -96,7 +96,7 @@ jobs:
         run: |
           cargo package --list
           echo "Package size:"
-          du -h target/package/psy-k-*.crate
+          du -h target/package/metrowrap-*.crate
 
 
   publish:

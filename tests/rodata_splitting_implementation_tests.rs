@@ -236,7 +236,11 @@ fn test_symbol_index_updates() {
 
     let obj_bytes = std::fs::read(&output_path).expect("Failed to read output file");
     let mut elf = Elf::from_bytes(&obj_bytes);
-    metrowrap::write_obj("target/.private/tests/implementation/rodata_splitting_implementation_tests.o", &elf.pack()).unwrap();
+    metrowrap::write_obj(
+        "target/.private/tests/implementation/rodata_splitting_implementation_tests.o",
+        &elf.pack(),
+    )
+    .unwrap();
 
     // Get all relocation sections
     let rel_sections: Vec<RelocationRecord> = elf.relocation_sections();
