@@ -127,7 +127,7 @@ MWCCPSP         := $(BIN_DIR)/mwccpsp.exe
 .PHONY: dependencies dependencies-pspeu dependencies-debian
 dependencies: dependencies-pspeu dependencies-debian
 dependencies-debian:
-	sudo apt-get install -y clang lld binutils-mipsel-linux-gnu
+	sudo apt-get install -y curl clang lld binutils-mipsel-linux-gnu
 dependencies-pspeu: $(ALLEGREX) $(MWCCPSP)
 $(WIBO):
 	mkdir -p $(BIN_DIR)
