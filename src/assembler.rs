@@ -2,7 +2,7 @@
 // SPDX-License-Identifier: BSD-3-CLAUSE
 use crate::error::MWError;
 use std::fs::File;
-use std::io::Read;
+use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use tempfile::NamedTempFile;
@@ -44,6 +44,8 @@ impl Assembler {
 
         let mut process = cmd.spawn()?;
         let mut stdin = process.stdin.take().unwrap();
+
+        stdin.write_all(b".set noreorder\n.set noat\n")?;
 
         if let Some(include) = &self.macro_inc_path {
             if include.is_file() {
