@@ -272,7 +272,19 @@ impl Elf {
     }
 
     pub fn find_symbol(&self, name: &str) -> Option<Symbol> {
-        self.get_symbols().iter().find(|s| s.name == name).cloned()
+        // Prefer defined symbols over UND
+        let mut und = None;
+        for s in self.get_symbols() {
+            if s.name == name {
+                if s.st_shndx != 0 {
+                    return Some(s.clone());
+                }
+                if und.is_none() {
+                    und = Some(s.clone());
+                }
+            }
+        }
+        und
     }
 
     pub fn add_section(&mut self, mut section: Section) -> usize {
@@ -330,7 +342,10 @@ impl Elf {
 
         self.sections
             .iter()
-            .filter(|s| s.name == ".text")
+            .filter(|s| {
+                (s.name == ".text" || s.name.starts_with(".text."))
+                    && s.data.len() > 0
+            })
             .enumerate()
             .map(|(i, s)| {
                 let mut text = TextSection::from_section(s.clone());
@@ -348,7 +363,7 @@ impl Elf {
         self.sections
             .iter()
             .enumerate()
-            .filter(|(_, section)| section.name == ".text")
+            .filter(|(_, section)| section.name == ".text" || section.name.starts_with(".text."))
             .enumerate()
             .filter(|(f, _)| name == function_names[*f])
             .map(|(_, (i, _))| i)
@@ -359,7 +374,7 @@ impl Elf {
     pub fn rodata_sections(&self) -> Vec<&Section> {
         self.sections
             .iter()
-            .filter(|s| s.name == ".rodata")
+            .filter(|s| s.name == ".rodata" || s.name.starts_with(".rodata."))
             .collect()
     }
 

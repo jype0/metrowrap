@@ -72,6 +72,15 @@ struct Args {
 
     #[arg(long)]
     target_encoding: Option<String>,
+    
+    /// Split monolithic sections into individual per-symbol sections.
+    #[arg(long)]
+    split_sections: bool,
+
+    /// Use plain section names (.text, .rodata) instead of .text.<name>.
+    /// Each symbol still gets its own section, but all share the same name.
+    #[arg(long)]
+    split_plain_names: bool,
 
     /// This catches everything else: unknown flags AND the file path.
     /// trailing_var_arg means everything after the first "unknown"
@@ -157,6 +166,8 @@ fn main() -> Result<(), Box<dyn Error>> {
         &preprocessor,
         &compiler,
         &assembler,
+        args.split_sections,
+        args.split_plain_names,
     ) {
         eprintln!("failed to process c file: {:?}", e);
         std::process::exit(1);

@@ -7,6 +7,7 @@ pub mod elf;
 pub mod error;
 pub mod makerule;
 pub mod preprocessor;
+pub mod split;
 
 use std::collections::{HashMap, HashSet};
 use std::error::Error;
@@ -22,6 +23,8 @@ use crate::assembler::Assembler;
 use crate::compiler::Compiler;
 use crate::constants::*;
 use crate::elf::Elf;
+use crate::elf::STT_SECTION;
+use crate::elf::SHT_REL;
 use crate::elf::Section;
 use crate::elf::section::{Relocation, RelocationRecord};
 use crate::makerule::MakeRule;
@@ -101,21 +104,158 @@ impl NamedString {
 
 pub fn process_c_file(
     c_content: &NamedString,
-    o_file: &Path, // TODO: make a WRITER
+    o_file: &Path,
     preprocessor: &Arc<Preprocessor>,
     compiler: &Compiler,
     assembler: &Assembler,
+    split_sections: bool,
+    split_plain_names: bool,
 ) -> Result<(), Box<dyn std::error::Error>> {
     // 1. Preprocess to find INCLUDE_ASM macros and produce stub source.
     let (new_lines, asm_files) = preprocessor.find_macros(&c_content.content);
 
     if asm_files.is_empty() {
-        // No INCLUDE_ASM macros: compile the original file directly and we're done.
+        // No INCLUDE_ASM macros: compile the original file directly.
         let (obj_bytes, make_rule) = c_content
             .with_tmp(|c_file| Ok(compiler.compile_file(c_file, c_content.source.name())?))?;
         write_dependency_file(compiler, make_rule, c_content, o_file)?;
+        if split_sections {
+            let mut elf = Elf::from_bytes(&obj_bytes);
+            split::split_monolithic_sections(&mut elf, split_plain_names, &HashMap::new())?;
+            return write_obj(o_file, &elf.pack());
+        }
         return write_obj(o_file, &obj_bytes);
     }
+
+
+    if split_sections {
+        // Compile stubs into monolithic .o
+        let temp_c = Builder::new()
+            .suffix(".c")
+            .tempfile_in(&c_content.src_dir)?;
+        std::fs::write(temp_c.path(), &new_lines)?;
+        let (obj_bytes, make_rule) =
+            compiler.compile_file(temp_c.path(), c_content.source.name())?;
+        write_dependency_file(compiler, make_rule, c_content, o_file)?;
+        let mut elf = Elf::from_bytes(&obj_bytes);
+
+        // Record sort keys: for ___mw___ symbols, use the UND original's index
+        let mut symbol_order: HashMap<String, usize> = HashMap::new();
+        for (i, sym) in elf.symtab.symbols.iter().enumerate() {
+            if sym.name.starts_with(FUNCTION_PREFIX) {
+                let real_name = &sym.name[FUNCTION_PREFIX.len()..];
+                // Find the UND entry for the real name
+                if let Some((und_idx, _)) = elf.symtab.symbols.iter().enumerate()
+                    .find(|(_, s)| s.name == real_name && s.st_shndx == 0)
+                {
+                    symbol_order.insert(real_name.to_string(), und_idx);
+                } else {
+                    symbol_order.insert(real_name.to_string(), i);
+                }
+            }
+        }
+
+        elf.symbol_cleanup();
+
+        // Remove UND symbols that have a defined counterpart
+        {
+            let defined_names: HashSet<String> = elf.symtab.symbols.iter()
+                .filter(|s| !s.name.is_empty() && s.st_shndx != 0)
+                .map(|s| s.name.clone())
+                .collect();
+            let mut to_remove: Vec<usize> = Vec::new();
+            for (i, sym) in elf.symtab.symbols.iter().enumerate() {
+                if sym.st_shndx == 0 && defined_names.contains(&sym.name) {
+                    to_remove.push(i);
+                }
+            }
+            if !to_remove.is_empty() {
+                // Build old→new index map
+                let old_len = elf.symtab.symbols.len();
+                let mut index_map: Vec<usize> = (0..old_len).collect();
+                let remove_set: HashSet<usize> = to_remove.iter().cloned().collect();
+                let mut new_idx = 0;
+                for old_idx in 0..old_len {
+                    if remove_set.contains(&old_idx) {
+                        // Map removed UND to its defined counterpart
+                        let name = &elf.symtab.symbols[old_idx].name;
+                        let def_idx = elf.symtab.symbols.iter()
+                            .position(|s| s.name == *name && s.st_shndx != 0)
+                            .unwrap();
+                        index_map[old_idx] = def_idx; // temporary, will adjust below
+                    } else {
+                        index_map[old_idx] = new_idx;
+                        new_idx += 1;
+                    }
+                }
+                // Now compute final indices: the defined counterparts also shift
+                let mut final_map: Vec<usize> = vec![0; old_len];
+                new_idx = 0;
+                for old_idx in 0..old_len {
+                    if !remove_set.contains(&old_idx) {
+                        final_map[old_idx] = new_idx;
+                        new_idx += 1;
+                    }
+                }
+                // For removed entries, point to the final index of their defined counterpart
+                for old_idx in &to_remove {
+                    let name = &elf.symtab.symbols[*old_idx].name;
+                    let def_old = elf.symtab.symbols.iter()
+                        .position(|s| s.name == *name && s.st_shndx != 0)
+                        .unwrap();
+                    final_map[*old_idx] = final_map[def_old];
+                }
+                // Remap all relocations
+                for section in &mut elf.sections {
+                    if section.sh_type == SHT_REL {
+                        for chunk in section.data.chunks_mut(8) {
+                            let r_info = u32::from_le_bytes(chunk[4..8].try_into().unwrap());
+                            let sym_idx = (r_info >> 8) as usize;
+                            let type_id = r_info & 0xff;
+                            if sym_idx < old_len {
+                                let new_info = ((final_map[sym_idx] as u32) << 8) | type_id;
+                                chunk[4..8].copy_from_slice(&new_info.to_le_bytes());
+                            }
+                        }
+                    }
+                }
+                // Remove symbols in reverse order
+                to_remove.sort();
+                for idx in to_remove.into_iter().rev() {
+                    elf.symtab.symbols.remove(idx);
+                }
+                // Update sh_info (first non-local index)
+                elf.symtab.section.sh_info = elf.symtab.symbols.iter()
+                    .position(|s| s.bind() != 0)
+                    .unwrap_or(elf.symtab.symbols.len()) as u32;
+            }
+        }
+        // Assemble all .s files in parallel
+        let asm_objects: Vec<(&PathBuf, usize, Vec<u8>)> = asm_files
+            .par_iter()
+            .map(|(asm_file, num_rodata_symbols)| {
+                let assembled_bytes = assembler
+                    .assemble_file(asm_file)
+                    .expect("assembled bytes");
+                (asm_file, *num_rodata_symbols, assembled_bytes)
+            })
+            .collect();
+
+        // Splice each into the monolithic sections
+        for (asm_file, _num_rodata, assembled_bytes) in &asm_objects {
+            splice_asm_into_monolithic(&mut elf, asm_file, assembled_bytes)?;
+        }
+
+        // Sync tables and split
+        elf.symtab.pack_data();
+        elf.sections[elf.symtab_idx] = elf.symtab.section.clone();
+        elf.strtab.pack_data();
+        elf.sections[elf.strtab_idx] = elf.strtab.section.clone();
+        split::split_monolithic_sections(&mut elf, split_plain_names, &symbol_order)?;
+        return write_obj(o_file, &elf.pack());
+    }
+
+    // --- Original non-split INCLUDE_ASM path (unchanged) ---
 
     // 3. Create temp C file with stubs
     let temp_c = Builder::new()
@@ -395,6 +535,322 @@ pub fn process_c_file(
 
     write_dependency_file(compiler, make_rule, c_content, o_file)?;
     write_obj(o_file, &compiled_elf.pack())?;
+
+    Ok(())
+}
+
+/// Splice one assembled .s file's code/data into the monolithic ELF sections.
+/// Replaces nop stubs with real instructions and appends relocations.
+fn splice_asm_into_monolithic(
+    elf: &mut Elf,
+    asm_file: &Path,
+    assembled_bytes: &[u8],
+) -> Result<(), Box<dyn std::error::Error>> {
+    let function_name = asm_file.file_stem().unwrap().to_str().unwrap();
+    let asm_elf = Elf::from_bytes(assembled_bytes);
+
+    let asm_functions = asm_elf.get_functions();
+    let has_text = !asm_functions.is_empty() && !asm_functions[0].section.data.is_empty();
+
+    // Find monolithic section indices
+    let text_idx = elf.sections.iter().position(|s| s.name == ".text");
+    let rodata_idx = elf.sections.iter().position(|s| s.name == ".rodata");
+
+    // Find the function symbol in the compiled ELF (after symbol_cleanup)
+    let func_sym = if has_text {
+        elf.find_symbol(function_name)
+    } else {
+        None
+    };
+
+    // 1. Splice .text bytes
+    if let (Some(fs), Some(ti)) = (&func_sym, text_idx) {
+        let asm_text = &asm_functions[0].section.data;
+        let offset = fs.st_value as usize;
+        let size = fs.st_size as usize;
+        assert!(
+            asm_text.len() >= size,
+            "Assembly for {} is {} bytes but stub is {}",
+            function_name, asm_text.len(), size
+        );
+        elf.sections[ti].data[offset..offset + size]
+            .copy_from_slice(&asm_text[..size]);
+    }
+
+    // 2. Splice .rodata bytes
+    let asm_rodata_sections = asm_elf.rodata_sections();
+    if let (Some(asm_rd), Some(ri)) = (asm_rodata_sections.first(), rodata_idx) {
+        let asm_rodata_idx = asm_elf
+            .sections
+            .iter()
+            .position(|s| s.name == ".rodata")
+            .unwrap_or(0);
+
+        let asm_rodata_syms: Vec<&crate::elf::Symbol> = asm_elf
+            .symtab
+            .symbols
+            .iter()
+            .filter(|s| {
+                s.st_shndx as usize == asm_rodata_idx
+                    && s.st_size > 0
+                    && !s.name.contains("NON_MATCHING")
+            })
+            .collect();
+
+        let mut asm_offset = 0usize;
+        for asm_sym in &asm_rodata_syms {
+            if let Some(compiled_sym) = elf.find_symbol(&asm_sym.name) {
+                let rdo = compiled_sym.st_value as usize;
+                let rdsz = compiled_sym.st_size as usize;
+                elf.sections[ri].data[rdo..rdo + rdsz]
+                    .copy_from_slice(&asm_rd.data[asm_offset..asm_offset + rdsz]);
+                asm_offset += rdsz;
+            }
+        }
+    }
+
+    // 3. Append relocations
+    let asm_reloc_sections = asm_elf.reloc_sections();
+    for (_, rel_section) in &asm_reloc_sections {
+        // Only process .rel.text and .rel.rodata; skip .rel.pdr etc.
+        let is_text_rel = rel_section.name.contains(".text");
+        let is_rodata_rel = rel_section.name.contains(".rodata");
+        if !is_text_rel && !is_rodata_rel {
+            continue;
+        }
+        let relocations = crate::elf::section::Relocation::unpack_all(&rel_section.data);
+
+        let base_offset = if is_text_rel {
+            func_sym.as_ref().map(|fs| fs.st_value).unwrap_or(0)
+        } else {
+            let asm_rodata_idx = asm_elf
+                .sections
+                .iter()
+                .position(|s| s.name == ".rodata")
+                .unwrap_or(0);
+            let first_asm_rd = asm_elf
+                .symtab
+                .symbols
+                .iter()
+                .find(|s| {
+                    s.st_shndx as usize == asm_rodata_idx
+                        && s.st_size > 0
+                        && !s.name.contains("NON_MATCHING")
+                });
+            if let Some(asm_sym) = first_asm_rd {
+                elf.find_symbol(&asm_sym.name)
+                    .map(|s| s.st_value)
+                    .unwrap_or(0)
+            } else {
+                0
+            }
+        };
+
+        let rel_name = if is_text_rel { ".rel.text" } else { ".rel.rodata" };
+        let compiled_rel_idx = match elf.sections.iter().position(|s| s.name == rel_name) {
+            Some(idx) => idx,
+            None => {
+                let sh_name = elf.shstrtab.add_symbol(rel_name);
+                let target_idx = if is_text_rel {
+                    match text_idx {
+                        Some(ti) => ti,
+                        None => continue,
+                    }
+                } else {
+                    match rodata_idx {
+                        Some(ri) => ri,
+                        None => continue,
+                    }
+                };
+                let mut sec = Section::new(
+                    sh_name, SHT_REL, 0, 0, 0, 0,
+                    elf.symtab_idx as u32,
+                    target_idx as u32,
+                    4, 8, vec![],
+                );
+                sec.name = rel_name.to_string();
+                elf.sections.push(sec);
+                elf.sections.len() - 1
+            }
+        };
+
+        for reloc in &relocations {
+            let mut new_reloc = reloc.clone();
+            new_reloc.r_offset += base_offset;
+
+            let asm_sym = &asm_elf.symtab().symbols[reloc.symbol_index()];
+
+            if asm_sym.type_id() == STT_SECTION {
+                let asm_sec = &asm_elf.sections[asm_sym.st_shndx as usize];
+                if asm_sec.name.contains("text") {
+                    if !is_text_rel {
+                        // Rodata jtable entry referencing .text section symbol.
+                        // Read the addend from rodata data and find the matching
+                        // .L label so objdiff sees the correct symbol reference.
+                        let mut found_label = false;
+                        if let Some(ri) = rodata_idx {
+                            let offset = new_reloc.r_offset as usize;
+                            if offset + 4 <= elf.sections[ri].data.len() {
+                                let addend = u32::from_le_bytes(
+                                    elf.sections[ri].data[offset..offset + 4]
+                                        .try_into()
+                                        .unwrap(),
+                                );
+                                let asm_text_idx = asm_elf
+                                    .sections
+                                    .iter()
+                                    .position(|s| s.name == ".text")
+                                    .unwrap_or(0);
+                                let label_sym = asm_elf.symtab.symbols.iter().find(|s| {
+                                    s.st_shndx as usize == asm_text_idx
+                                        && s.st_value == addend
+                                        && !s.name.is_empty()
+                                        && s.type_id() != STT_SECTION
+                                });
+                                if let Some(label) = label_sym {
+                                    let mut sym = label.clone();
+                                    if let Some(ti) = text_idx {
+                                        sym.st_shndx = ti as u16;
+                                        if let Some(ref fs) = func_sym {
+                                            sym.st_value += fs.st_value;
+                                        }
+                                    }
+                                    let idx = elf.add_symbol_get_index(sym.clone(), false);
+                                    let existing = &mut elf.symtab.symbols[idx];
+                                    if existing.st_shndx == 0 && sym.st_shndx != 0 {
+                                        existing.st_shndx = sym.st_shndx;
+                                        existing.st_value = sym.st_value;
+                                        existing.st_size = sym.st_size;
+                                        existing.st_info = sym.st_info;
+                                    }
+                                    new_reloc.set_symbol_index(idx as u32);
+                                    // Zero the data — symbol value now carries the address
+                                    elf.sections[ri].data[offset..offset + 4]
+                                        .copy_from_slice(&[0, 0, 0, 0]);
+                                    found_label = true;
+                                }
+                            }
+                        }
+                        if !found_label {
+                            // Fallback: use function symbol
+                            if let Some((fi, _)) =
+                                elf.symtab.get_symbol_by_name(function_name.to_string())
+                            {
+                                new_reloc.set_symbol_index(fi as u32);
+                            }
+                        }
+                    } else {
+                        // .text relocation — use function symbol
+                        if let Some((fi, _)) =
+                            elf.symtab.get_symbol_by_name(function_name.to_string())
+                        {
+                            new_reloc.set_symbol_index(fi as u32);
+                        }
+                    }
+                } else if asm_sec.name.contains("rodata") {
+                    let asm_ri = asm_elf
+                        .sections
+                        .iter()
+                        .position(|s| s.name == ".rodata")
+                        .unwrap_or(0);
+                    let first = asm_elf
+                        .symtab
+                        .symbols
+                        .iter()
+                        .find(|s| s.st_shndx as usize == asm_ri && s.st_size > 0);
+                    if let Some(fs) = first {
+                        if let Some((ri, _)) =
+                            elf.symtab.get_symbol_by_name(fs.name.clone())
+                        {
+                            new_reloc.set_symbol_index(ri as u32);
+                        }
+                    }
+                }
+            } else {
+                let mut sym_to_add = asm_sym.clone();
+
+                // Local .text symbols (.L labels, jump targets): convert relocation
+                // to reference the function symbol instead of adding locals to symtab
+                // (adding locals shifts global indices and breaks existing relocations)
+                if sym_to_add.bind() == 0 && sym_to_add.st_shndx != 0 {
+                    let asm_sec = &asm_elf.sections[sym_to_add.st_shndx as usize];
+                    if asm_sec.name.contains("text") {
+                        if let Some((fi, _)) =
+                            elf.symtab.get_symbol_by_name(function_name.to_string())
+                        {
+                            new_reloc.set_symbol_index(fi as u32);
+                            elf.sections[compiled_rel_idx]
+                                .data
+                                .extend_from_slice(&new_reloc.pack());
+                            elf.sections[compiled_rel_idx].sh_size =
+                                elf.sections[compiled_rel_idx].data.len() as u32;
+                            continue;
+                        }
+                    }
+                }
+
+                // Normal path: remap section index to monolithic
+                if sym_to_add.st_shndx != 0 {
+                    let asm_sec = &asm_elf.sections[sym_to_add.st_shndx as usize];
+                    if asm_sec.name.contains("text") {
+                        if let Some(ti) = text_idx {
+                            sym_to_add.st_shndx = ti as u16;
+                            if let Some(ref fs) = func_sym {
+                                sym_to_add.st_value += fs.st_value;
+                            }
+                        }
+                    } else if asm_sec.name.contains("rodata") {
+                        if let Some(ri) = rodata_idx {
+                            sym_to_add.st_shndx = ri as u16;
+                        }
+                    }
+                }
+                let idx = elf.add_symbol_get_index(sym_to_add.clone(), false);
+                // Upgrade UND → defined if we now have a definition
+                if sym_to_add.st_shndx != 0 {
+                    let existing = &mut elf.symtab.symbols[idx];
+                    if existing.st_shndx == 0 {
+                        existing.st_shndx = sym_to_add.st_shndx;
+                        existing.st_value = sym_to_add.st_value;
+                        existing.st_size = sym_to_add.st_size;
+                        existing.st_info = sym_to_add.st_info;
+                    }
+                }
+                new_reloc.set_symbol_index(idx as u32);
+            }
+
+            elf.sections[compiled_rel_idx]
+                .data
+                .extend_from_slice(&new_reloc.pack());
+            elf.sections[compiled_rel_idx].sh_size =
+                elf.sections[compiled_rel_idx].data.len() as u32;
+        }
+    }
+    // Add all defined .text symbols from assembled .o (e.g., .L jump labels
+    // that the jtable references but .text doesn't branch to directly)
+    for symbol in asm_elf.get_symbols() {
+        if symbol.st_name == 0 || symbol.st_shndx == 0 || symbol.st_shndx >= 0xFF00 {
+            continue;
+        }
+        let asm_sec = &asm_elf.sections[symbol.st_shndx as usize];
+        if asm_sec.name.contains("text") {
+            let mut sym = symbol.clone();
+            if let Some(ti) = text_idx {
+                sym.st_shndx = ti as u16;
+                if let Some(ref fs) = func_sym {
+                    sym.st_value += fs.st_value;
+                }
+            }
+            let idx = elf.add_symbol_get_index(sym.clone(), false);
+            let existing = &mut elf.symtab.symbols[idx];
+            if existing.st_shndx == 0 && sym.st_shndx != 0 {
+                existing.st_shndx = sym.st_shndx;
+                existing.st_value = sym.st_value;
+                existing.st_size = sym.st_size;
+                existing.st_info = sym.st_info;
+            }
+        }
+    }
 
     Ok(())
 }

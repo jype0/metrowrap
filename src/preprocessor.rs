@@ -74,7 +74,12 @@ impl Preprocessor {
                 if line.starts_with(".size") {
                     continue;
                 }
-
+                if line.starts_with("nonmatching") {
+                    continue;
+                }
+                if line.starts_with("enddlabel") {
+                    continue;
+                }
                 if line.starts_with("glabel") || line.starts_with("dlabel") {
                     let prefix_str = line.replace(LOCAL_SUFFIX, "");
                     let parts: Vec<&str> = prefix_str.split_whitespace().collect();
@@ -158,6 +163,8 @@ impl Preprocessor {
         }
 
         if nops_needed > 0 {
+            // prototpye
+            c_lines.push(format!("void {}();", function_name));
             c_lines.push(format!("asm void {}() {{", function_name));
             for _ in 0..nops_needed {
                 c_lines.push("  nop".to_string());
