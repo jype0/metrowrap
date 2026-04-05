@@ -82,6 +82,10 @@ struct Args {
     #[arg(long)]
     split_plain_names: bool,
 
+    /// Override the ELF e_flags field in the output object.
+    #[arg(long)]
+    elf_flags: Option<String>,
+
     /// This catches everything else: unknown flags AND the file path.
     /// trailing_var_arg means everything after the first "unknown"
     /// or positional is dumped here.
@@ -172,6 +176,17 @@ fn main() -> Result<(), Box<dyn Error>> {
         eprintln!("failed to process c file: {:?}", e);
         std::process::exit(1);
     }
+
+    if let Some(flags_hex) = &args.elf_flags {
+        let flags = u32::from_str_radix(flags_hex.trim_start_matches("0x"), 16)
+            .expect("invalid hex value for --elf-flags");
+        let mut data = std::fs::read(&args.output).expect("read output");
+        if data.len() >= 40 {
+            data[36..40].copy_from_slice(&flags.to_le_bytes());
+            std::fs::write(&args.output, &data).expect("write output");
+        }
+    }
+
 
     Ok(())
 }
