@@ -110,6 +110,7 @@ pub fn process_c_file(
     assembler: &Assembler,
     split_sections: bool,
     split_plain_names: bool,
+    elf_flags: Option<u32>,
 ) -> Result<(), Box<dyn std::error::Error>> {
     // 1. Preprocess to find INCLUDE_ASM macros and produce stub source.
     let (new_lines, asm_files) = preprocessor.find_macros(&c_content.content);
@@ -121,8 +122,16 @@ pub fn process_c_file(
         write_dependency_file(compiler, make_rule, c_content, o_file)?;
         if split_sections {
             let mut elf = Elf::from_bytes(&obj_bytes);
+            if let Some(flags) = elf_flags {
+                elf.header.e_flags = flags;
+            }
             split::split_monolithic_sections(&mut elf, split_plain_names, &HashMap::new())?;
             return write_obj(o_file, &elf.pack());
+        }
+        if let Some(flags) = elf_flags {
+            let mut patched = obj_bytes;
+            patched[36..40].copy_from_slice(&flags.to_le_bytes());
+            return write_obj(o_file, &patched);
         }
         return write_obj(o_file, &obj_bytes);
     }
@@ -138,7 +147,9 @@ pub fn process_c_file(
             compiler.compile_file(temp_c.path(), c_content.source.name())?;
         write_dependency_file(compiler, make_rule, c_content, o_file)?;
         let mut elf = Elf::from_bytes(&obj_bytes);
-
+        if let Some(flags) = elf_flags {
+            elf.header.e_flags = flags;
+        }
         // Record sort keys: for ___mw___ symbols, use the UND original's index
         let mut symbol_order: HashMap<String, usize> = HashMap::new();
         for (i, sym) in elf.symtab.symbols.iter().enumerate() {
@@ -534,6 +545,9 @@ pub fn process_c_file(
     }
 
     write_dependency_file(compiler, make_rule, c_content, o_file)?;
+    if let Some(flags) = elf_flags {
+        compiled_elf.header.e_flags = flags;
+    }
     write_obj(o_file, &compiled_elf.pack())?;
 
     Ok(())

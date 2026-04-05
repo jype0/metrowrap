@@ -164,6 +164,15 @@ fn main() -> Result<(), Box<dyn Error>> {
         }
     };
 
+    let elf_flags = args.elf_flags.map(|s| {
+        if s.starts_with("0x") || s.starts_with("0X") {
+            u32::from_str_radix(s.trim_start_matches("0x").trim_start_matches("0X"), 16)
+        } else {
+            s.parse::<u32>()
+        }
+        .expect("invalid value for --elf-flags")
+    });
+
     if let Err(e) = metrowrap::process_c_file(
         &c_reader,
         &args.output,
@@ -172,19 +181,10 @@ fn main() -> Result<(), Box<dyn Error>> {
         &assembler,
         args.split_sections,
         args.split_plain_names,
+        elf_flags,
     ) {
         eprintln!("failed to process c file: {:?}", e);
         std::process::exit(1);
-    }
-
-    if let Some(flags_hex) = &args.elf_flags {
-        let flags = u32::from_str_radix(flags_hex.trim_start_matches("0x"), 16)
-            .expect("invalid hex value for --elf-flags");
-        let mut data = std::fs::read(&args.output).expect("read output");
-        if data.len() >= 40 {
-            data[36..40].copy_from_slice(&flags.to_le_bytes());
-            std::fs::write(&args.output, &data).expect("write output");
-        }
     }
 
 
