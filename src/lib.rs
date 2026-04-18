@@ -125,7 +125,7 @@ pub fn process_c_file(
             if let Some(flags) = elf_flags {
                 elf.header.e_flags = flags;
             }
-            split::split_monolithic_sections(&mut elf, split_plain_names, &HashMap::new())?;
+            split::split_monolithic_sections(&mut elf, split_plain_names)?;
             return write_obj(o_file, &elf.pack());
         }
         if let Some(flags) = elf_flags {
@@ -150,22 +150,6 @@ pub fn process_c_file(
         if let Some(flags) = elf_flags {
             elf.header.e_flags = flags;
         }
-        // Record sort keys: for ___mw___ symbols, use the UND original's index
-        let mut symbol_order: HashMap<String, usize> = HashMap::new();
-        for (i, sym) in elf.symtab.symbols.iter().enumerate() {
-            if sym.name.starts_with(FUNCTION_PREFIX) {
-                let real_name = &sym.name[FUNCTION_PREFIX.len()..];
-                // Find the UND entry for the real name
-                if let Some((und_idx, _)) = elf.symtab.symbols.iter().enumerate()
-                    .find(|(_, s)| s.name == real_name && s.st_shndx == 0)
-                {
-                    symbol_order.insert(real_name.to_string(), und_idx);
-                } else {
-                    symbol_order.insert(real_name.to_string(), i);
-                }
-            }
-        }
-
         elf.symbol_cleanup();
 
         // Remove UND symbols that have a defined counterpart
@@ -262,7 +246,7 @@ pub fn process_c_file(
         elf.sections[elf.symtab_idx] = elf.symtab.section.clone();
         elf.strtab.pack_data();
         elf.sections[elf.strtab_idx] = elf.strtab.section.clone();
-        split::split_monolithic_sections(&mut elf, split_plain_names, &symbol_order)?;
+        split::split_monolithic_sections(&mut elf, split_plain_names)?;
         return write_obj(o_file, &elf.pack());
     }
 

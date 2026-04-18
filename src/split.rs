@@ -36,7 +36,7 @@ struct SectionSplit {
     entries: Vec<SplitEntry>,
 }
 
-fn collect_split_info(elf: &Elf, section_name: &str, symbol_order: &HashMap<String, usize>) -> Option<SectionSplit> {
+fn collect_split_info(elf: &Elf, section_name: &str) -> Option<SectionSplit> {
     let section_idx = elf.sections.iter().position(|s| s.name == section_name)?;
     let section = &elf.sections[section_idx];
 
@@ -94,17 +94,8 @@ fn collect_split_info(elf: &Elf, section_name: &str, symbol_order: &HashMap<Stri
         return None;
     }
     
-    if section.sh_type == SHT_NOBITS {
-        entries.sort_by_key(|e| {
-        *symbol_order.get(&e.name).unwrap_or(&e.sym_idx)
-    });
-    } else {
-        entries.sort_by_key(|e| {
-            let bind = elf.symtab.symbols[e.sym_idx].bind();
-            (bind, e.original_value)
-        });
-    }
-    
+    entries.sort_by_key(|e| e.sym_idx);
+
     let rel_name = format!(".rel{}", section_name);
     let rel_section_idx = elf
         .sections
@@ -118,14 +109,14 @@ fn collect_split_info(elf: &Elf, section_name: &str, symbol_order: &HashMap<Stri
     })
 }
 
-pub fn split_monolithic_sections(elf: &mut Elf, plain_names: bool, symbol_order: &HashMap<String, usize>) -> Result<(), MWError> {
+pub fn split_monolithic_sections(elf: &mut Elf, plain_names: bool) -> Result<(), MWError> {
     let sections_to_split = [".text", ".rodata", ".data", ".sdata", ".sbss", ".bss"];
 
     let mut splits: Vec<SectionSplit> = Vec::new();
     let mut removed: HashSet<usize> = HashSet::new();
 
     for name in &sections_to_split {
-        if let Some(split) = collect_split_info(elf, name, symbol_order) {
+        if let Some(split) = collect_split_info(elf, name) {
             removed.insert(split.section_idx);
             if let Some(ri) = split.rel_section_idx {
                 removed.insert(ri);
