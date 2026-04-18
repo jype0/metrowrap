@@ -152,53 +152,44 @@ pub fn process_c_file(
         }
         elf.symbol_cleanup();
 
-        // Remove UND symbols that have a defined counterpart
+        // INCLUDE_ASM merge: move DEFINED ___mw___ stub into its UND slot so
+        // the symbol keeps the earlier position mwcc would have emitted natively.
         {
-            let defined_names: HashSet<String> = elf.symtab.symbols.iter()
-                .filter(|s| !s.name.is_empty() && s.st_shndx != 0)
-                .map(|s| s.name.clone())
-                .collect();
-            let mut to_remove: Vec<usize> = Vec::new();
+            let old_len = elf.symtab.symbols.len();
+            let mut merges: Vec<(usize, usize)> = Vec::new();
             for (i, sym) in elf.symtab.symbols.iter().enumerate() {
-                if sym.st_shndx == 0 && defined_names.contains(&sym.name) {
-                    to_remove.push(i);
+                if sym.st_shndx != 0 || sym.name.is_empty() {
+                    continue;
+                }
+                if let Some(def_idx) = elf.symtab.symbols.iter()
+                    .position(|s| s.name == sym.name && s.st_shndx != 0)
+                {
+                    merges.push((i, def_idx));
                 }
             }
-            if !to_remove.is_empty() {
-                // Build old→new index map
-                let old_len = elf.symtab.symbols.len();
-                let mut index_map: Vec<usize> = (0..old_len).collect();
-                let remove_set: HashSet<usize> = to_remove.iter().cloned().collect();
-                let mut new_idx = 0;
-                for old_idx in 0..old_len {
-                    if remove_set.contains(&old_idx) {
-                        // Map removed UND to its defined counterpart
-                        let name = &elf.symtab.symbols[old_idx].name;
-                        let def_idx = elf.symtab.symbols.iter()
-                            .position(|s| s.name == *name && s.st_shndx != 0)
-                            .unwrap();
-                        index_map[old_idx] = def_idx; // temporary, will adjust below
-                    } else {
-                        index_map[old_idx] = new_idx;
-                        new_idx += 1;
-                    }
+
+            if !merges.is_empty() {
+                for &(und_idx, def_idx) in &merges {
+                    let def_sym = elf.symtab.symbols[def_idx].clone();
+                    let und_st_name = elf.symtab.symbols[und_idx].st_name;
+                    elf.symtab.symbols[und_idx] = def_sym;
+                    elf.symtab.symbols[und_idx].st_name = und_st_name;
                 }
-                // Now compute final indices: the defined counterparts also shift
+
+                // Build old→new index map; removed DEFINED entries collapse to
+                // the UND slot they were merged into.
+                let remove_set: HashSet<usize> =
+                    merges.iter().map(|(_, d)| *d).collect();
                 let mut final_map: Vec<usize> = vec![0; old_len];
-                new_idx = 0;
+                let mut new_idx = 0;
                 for old_idx in 0..old_len {
                     if !remove_set.contains(&old_idx) {
                         final_map[old_idx] = new_idx;
                         new_idx += 1;
                     }
                 }
-                // For removed entries, point to the final index of their defined counterpart
-                for old_idx in &to_remove {
-                    let name = &elf.symtab.symbols[*old_idx].name;
-                    let def_old = elf.symtab.symbols.iter()
-                        .position(|s| s.name == *name && s.st_shndx != 0)
-                        .unwrap();
-                    final_map[*old_idx] = final_map[def_old];
+                for &(und_idx, def_idx) in &merges {
+                    final_map[def_idx] = final_map[und_idx];
                 }
                 // Remap all relocations
                 for section in &mut elf.sections {
@@ -215,6 +206,7 @@ pub fn process_c_file(
                     }
                 }
                 // Remove symbols in reverse order
+                let mut to_remove: Vec<usize> = remove_set.into_iter().collect();
                 to_remove.sort();
                 for idx in to_remove.into_iter().rev() {
                     elf.symtab.symbols.remove(idx);
